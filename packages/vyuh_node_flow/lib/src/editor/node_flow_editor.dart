@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart' hide HitTestResult;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -309,6 +310,17 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
   // Keeps the canvas subtree (and its state, e.g. a focused TextField) alive when
   // we swap the InteractiveViewer for a plain Transform while the canvas is locked.
   final GlobalKey _canvasContentKey = GlobalKey();
+  // Drives the InteractiveViewer↔Transform swap for text editing through a mobx
+  // observable instead of setState. Read inside the canvas Observer, a change
+  // rebuilds only that Observer (build phase) — exactly like canvasLocked — so
+  // reparenting the GlobalKey content happens in build, never inside the enclosing
+  // LayoutBuilder's layout pass (illegal when the focused field has an active
+  // text-selection OverlayPortal). setState instead marked the LayoutBuilder
+  // _needsBuild, deferring the reparent INTO layout — the crash this avoids.
+  final Observable<bool> _editingText = Observable<bool>(false);
+  // Cached keyboard visibility (from didChangeDependencies) so the swap builder
+  // never reads MediaQuery directly.
+  bool _keyboardVisible = false;
   final List<ReactionDisposer> _disposers = [];
   bool _isSyncingViewportFromTransform = false;
 
@@ -443,7 +455,7 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
 
     // React to focus changes so the InteractiveViewer/Transform swap can engage
     // the instant a text field gains focus (immediate, unlike the keyboard insets
-    // which lag behind) — see [_isEditingNodeText].
+    // which lag behind) — see [_updateEditingText].
     FocusManager.instance.addListener(_onFocusChange);
 
     // Provide transformation controller to debug extension for layer rendering
@@ -516,6 +528,16 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
         widget.theme.connectionTheme.animationEffect) {
       _updateAnimationController();
     }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Track keyboard visibility here (subscribes to MediaQuery) instead of reading
+    // it inside the swap builder; a change republishes [_editingText] via the
+    // notifier, so the swap's content reparent stays in the build phase.
+    _keyboardVisible = MediaQuery.viewInsetsOf(context).bottom > 0;
+    _updateEditingText();
   }
 
   /// Collects plugin layers for the given position relative to a core layer.
@@ -596,23 +618,28 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
                             // When canvas is locked, disable both pan and zoom
                             final isLocked = widget.controller.canvasLocked;
                             // Also bypass the InteractiveViewer while editing a
-                            // node's text field (focus-driven, so it engages the
-                            // instant the field focuses — before the keyboard even
-                            // animates in). Keeping the InteractiveViewer out of the
-                            // tree the WHOLE editing session avoids a rebuild on
-                            // touch-release that would immediately dismiss the
-                            // just-made text selection.
-                            final editingText = _isEditingNodeText;
-                            // While locked or editing, swap the InteractiveViewer for
-                            // a plain Transform applying the same matrix.
-                            // InteractiveViewer ALWAYS keeps a ScaleGestureRecognizer
-                            // in the arena (even with pan/scale disabled), which
-                            // steals long-press text selection from a TextField
-                            // embedded in a node. A bare Transform has no gesture
-                            // detector, so descendant gestures win. AnimatedBuilder
-                            // keeps it in sync with autopan (the viewport can move
-                            // during a node drag).
-                            if (isLocked || editingText) {
+                            // node's text field. Driven by a mobx observable
+                            // (_editingText, updated on focus/keyboard changes) so
+                            // reading it here makes THIS Observer rebuild in the
+                            // build phase — keeping the canvas reparent out of the
+                            // LayoutBuilder's layout pass. Kept engaged the WHOLE
+                            // editing session so a touch-release rebuild can't
+                            // dismiss the just-made text selection.
+                            final editingText = _editingText.value;
+                            // The InteractiveViewer→Transform swap is a TOUCH-ONLY
+                            // workaround. InteractiveViewer always keeps a
+                            // ScaleGestureRecognizer in the arena (even with pan/scale
+                            // disabled), which steals long-press text selection from a
+                            // TextField in a node; for touch we drop to a bare
+                            // Transform (no gesture detector → descendant gestures
+                            // win), kept in sync with autopan by the AnimatedBuilder.
+                            // On DESKTOP we NEVER swap: the upstream package already
+                            // pans/zooms on desktop with the InteractiveViewer kept and
+                            // gated by isLocked, and swapping would reparent the
+                            // GlobalKey content while a mouse-hover Tooltip
+                            // OverlayPortal is active — illegal inside the enclosing
+                            // LayoutBuilder's layout pass (the Linux-only crash).
+                            if (_isTouchPlatform && (isLocked || editingText)) {
                               return ClipRect(
                                 child: AnimatedBuilder(
                                   animation: _transformationController,
@@ -1041,22 +1068,52 @@ class _NodeFlowEditorState<T, C> extends State<NodeFlowEditor<T, C>>
   }
 
   void _onFocusChange() {
-    // Rebuild so the InteractiveViewer/Transform swap reflects whether a node's
-    // text field is focused. Cheap: focus changes are rare.
-    if (mounted) setState(() {});
+    // Publish the editing state via the notifier (NOT setState) so the swap's
+    // content reparent runs in the build phase, not layout — see [_editingText].
+    _updateEditingText();
   }
 
-  /// Whether the user is currently editing a node's text field, in which case we
+  /// Whether the user is currently editing a node's text field. While editing we
   /// keep the plain-Transform path (no InteractiveViewer gestures) so text
   /// selection works AND the swap doesn't flip back on touch-release (which would
   /// dismiss the selection). Uses focus (immediate) OR the keyboard insets
-  /// (fallback). In this editor, any non-canvas primary focus is a form field.
+  /// (fallback, cached in [_keyboardVisible]). In this editor, any non-canvas
+  /// primary focus is a form field. Read live by the tap-focus guard; published to
+  /// the [_editingText] observable (which drives the swap) by [_updateEditingText].
   bool get _isEditingNodeText {
-    if (MediaQuery.viewInsetsOf(context).bottom > 0) return true;
+    // TOUCH ONLY. The sticky editing swap exists because, after a long-press
+    // selection, the finger lifts (releasing canvasLocked) yet the keyboard and
+    // selection must persist — so we hold the InteractiveViewer out by focus. On
+    // desktop none of that applies: text selection is a click-drag, during which
+    // the pointer-down canvasLocked swap already gives the field a recognizer-free
+    // Transform path; a merely-focused field must NOT reparent the canvas, because
+    // its hover Tooltip / selection OverlayPortal would reactivate during the
+    // enclosing LayoutBuilder's layout pass and throw. That reparent-in-layout is
+    // why this crashed on Linux/desktop but not on touch (no mouse hover there).
+    if (!_isTouchPlatform) return false;
+    if (_keyboardVisible) return true;
     final focus = FocusManager.instance.primaryFocus;
     return focus != null &&
         focus != widget.controller.canvasFocusNode &&
         focus.context != null;
+  }
+
+  /// Whether the host is a touch platform (where the sticky editing swap is
+  /// needed). Desktop uses the pointer-down canvasLocked swap instead.
+  bool get _isTouchPlatform =>
+      defaultTargetPlatform == TargetPlatform.android ||
+      defaultTargetPlatform == TargetPlatform.iOS ||
+      defaultTargetPlatform == TargetPlatform.fuchsia;
+
+  /// Publishes [_isEditingNodeText] to the [_editingText] observable so the canvas
+  /// Observer re-evaluates the InteractiveViewer/Transform swap in the build phase
+  /// (never inside the LayoutBuilder's layout pass).
+  void _updateEditingText() {
+    if (!mounted) return;
+    final editing = _isEditingNodeText;
+    if (_editingText.value != editing) {
+      runInAction(() => _editingText.value = editing);
+    }
   }
 
   // Event handlers
